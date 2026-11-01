@@ -14,7 +14,7 @@ DEST="${1:-/var/backups/max-mcp}"
 install -d -m 700 "$DEST"
 OUT="$DEST/service-$(date +%Y%m%d-%H%M%S).db"
 # .backup делает согласованную копию даже во время работы сервиса
-runuser -u maxmcp -- /opt/max-mcp/venv/bin/python - "$DB" "$OUT.tmp" <<'EOF'
+/opt/max-mcp/venv/bin/python - "$DB" "$OUT.tmp" <<'EOF'
 import sqlite3, sys
 src, dst = sqlite3.connect(sys.argv[1]), sqlite3.connect(sys.argv[2])
 src.backup(dst)
