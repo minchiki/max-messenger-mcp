@@ -1,10 +1,13 @@
 """Инструменты чтения: помечены read-only, ChatGPT вызывает их без подтверждения."""
 import asyncio
+import collections
 import time
+from datetime import datetime
 
 import core
 import media
-from core import chat_id, fetch, fmt, mx, names, render, uname, when
+from core import TZ, chat_id, fetch, fmt, mx, names, render, uname, when
+from dates import parse_when
 from safety import clean, name
 
 TEXT_MIMES = ("text/", "application/json", "application/xml", "application/csv")
@@ -95,18 +98,58 @@ def register(tool, Image):
         return "\n".join(lines)
 
     @tool()
-    async def max_read_messages(chat: str, limit: int = 30, before_id: int = 0) -> str:
-        """Сообщения чата, старые сверху. chat — id, название или me (Избранное).
+    async def max_read_messages(chat: str, limit: int = 30, before_id: int = 0, date_from: str = "", date_to: str = "",
+                                text_limit: int = 1000) -> str:
+        """История чата, старые сверху. chat — id, название или me (Избранное). #N — id сообщения, ↩N — ответ на N.
 
-        #N — id сообщения, ↩N — ответ на сообщение N. Листать назад: before_id = самый старый #N."""
+        Любая глубина: limit до 5000. date_from / date_to — период (2025-03, 2025-11-01 14:30, 31.10.2025, 1y, «год назад»):
+        «сообщения за март прошлого года» = date_from=2025-03, date_to=2025-03, limit=5000.
+        Если ответ обрезан, в конце подсказка before_id для продолжения в прошлое. text_limit — обрезать длинные сообщения."""
         c = await mx()
-        cid = await chat_id(c, chat)
-        start = None
-        if before_id:
-            m = await c.get_message(cid, before_id)
-            start = m.time if m else None
-        msgs = [m for m in await fetch(c, cid, min(limit, 500), from_time=start) if m.id != before_id]
-        return "\n".join(await render(c, msgs[-limit:])) or "Сообщений нет."
+        lines, hint = await core.history(c, await chat_id(c, chat), limit, date_from, date_to, before_id, text_limit)
+        if not lines:
+            return "Сообщений за этот период нет."
+        head = f"{len(lines)} сообщений, с {lines[0][lines[0].index('[') + 1:][:14]} по {lines[-1][lines[-1].index('[') + 1:][:14]}"
+        return "\n".join([head, *lines, *([hint] if hint else [])])
+
+    @tool()
+    async def max_messages_around_date(chat: str, when: str, around: int = 10) -> str:
+        """Сообщения вокруг даты — around до и around после (2025-03-14, «год назад», 31.10.2025 18:00). Прыжок в прошлое."""
+        c = await mx()
+        t = parse_when(when, TZ)
+        if t is None:
+            raise ValueError("Укажите дату")
+        around = max(1, min(around, 200))
+        msgs = await c.fetch_history(await chat_id(c, chat), from_time=int(t.timestamp() * 1000), backward=around, forward=around)
+        return "\n".join(await render(c, sorted(msgs, key=lambda m: m.time), 600)) or "Рядом с этой датой сообщений нет."
+
+    @tool()
+    async def max_chat_timeline(chat: str, date_from: str = "", date_to: str = "", step: str = "month", scan: int = 20000) -> str:
+        """Активность чата по периодам (step: year, month, week) и самые активные участники.
+
+        MAX не отдаёт счётчики, поэтому сервер просматривает до scan сообщений (по умолчанию 20000, около 10–20 с).
+        Находит, когда шла переписка; потом читайте нужный период через max_read_messages(date_from, date_to)."""
+        c = await mx()
+        lo, hi = parse_when(date_from, TZ), parse_when(date_to, TZ, end=True)
+        key = {"year": "%Y", "week": "%G-W%V"}.get(step, "%Y-%m")
+        per, who, total, last = collections.Counter(), collections.Counter(), 0, None
+        async for page in core.pages(c, await chat_id(c, chat), lo, hi):
+            for m in page:
+                per[datetime.fromtimestamp(m.time / 1000, TZ).strftime(key)] += 1
+                who[m.sender] += 1
+                last = m
+            total += len(page)
+            if total >= scan:
+                break
+        if not per:
+            return "Сообщений за этот период нет."
+        top = max(per.values())
+        rows = [f"{k}  {per[k]:>6}  {'█' * max(1, round(24 * per[k] / top))}" for k in sorted(per)]
+        known = await names(c, [u for u, _ in who.most_common(10)])
+        people = ", ".join(f"{known.get(u, u)} {n}" for u, n in who.most_common(8))
+        more = " (дальше есть ещё: увеличьте scan)" if total >= scan else ""
+        return f"Просмотрено {total}, самое раннее: {datetime.fromtimestamp(last.time / 1000, TZ):%Y-%m-%d}{more}\n" \
+            + "\n".join(rows) + f"\nАктивнее всех: {people}"
 
     @tool()
     async def max_get_message_context(chat: str, message_id: int, around: int = 5) -> str:
@@ -121,32 +164,37 @@ def register(tool, Image):
         return "\n".join(await render(c, msgs))
 
     @tool()
-    async def max_search_messages(query: str, chat: str = "", depth: int = 300, limit: int = 30) -> str:
+    async def max_search_messages(query: str, chat: str = "", depth: int = 300, limit: int = 30, date_from: str = "",
+                                  date_to: str = "", before_id: int = 0) -> str:
         """Поиск по тексту и именам файлов. chat пустой — по 30 последним чатам сразу (параллельно).
 
-        depth — сколько последних сообщений просматривать в каждом чате (MAX не ищет на сервере)."""
+        MAX не ищет на сервере, поэтому сообщения просматриваются подряд: depth — сколько просматривать в чате
+        (до 20000; без chat — до 300 в каждом). date_from / date_to сужают период и ускоряют поиск
+        («что мне писали год назад»). Если найдено ровно limit, в конце подсказка before_id."""
         c = await mx()
         q = query.casefold()
-        if chat:
-            ids = [await chat_id(c, chat)]
-        else:
-            ids = [ch.id for ch in sorted(c.acc.chats.values(), key=lambda x: x.last_event_time, reverse=True)[:30]]
-            depth = min(depth, 150)
+        lo, hi = parse_when(date_from, TZ), parse_when(date_to, TZ, end=True)
+        limit = max(1, min(limit, core.HISTORY_MAX))
 
         def hit(m):
             files = " ".join(getattr(a, "name", "") or "" for a in m.attaches)
             return q in f"{m.text or ''} {files}".casefold()
 
-        pages = await asyncio.gather(*(fetch(c, i, depth) for i in ids), return_exceptions=True)
+        if chat:
+            cid = await chat_id(c, chat)
+            found, scanned, stopped = await core.scan(c, cid, hit, lo, hi, max(1, min(depth, 20000)), limit, before_id)
+            lines = await render(c, list(reversed(found)), 600)
+            tail = (f"… просмотрено {scanned}, найдено {len(found)}, дальше: before_id={found[-1].id}" if stopped
+                    else f"… просмотрено {scanned} сообщений" + (", есть более старые: увеличьте depth" if scanned >= depth else ""))
+            return "\n".join([*lines, tail]) if lines else f"Ничего не найдено ({tail[2:]})."
+        ids = [ch.id for ch in sorted(c.acc.chats.values(), key=lambda x: x.last_event_time, reverse=True)[:30]]
+        res = await asyncio.gather(*(core.scan(c, i, hit, lo, hi, min(depth, 300), limit) for i in ids), return_exceptions=True)
         t = await core.titles(c, [c.acc.chats[i] for i in ids if i in c.acc.chats])
         out = []
-        for cid, msgs in zip(ids, pages):
-            if isinstance(msgs, Exception):
+        for cid, r in zip(ids, res):
+            if isinstance(r, Exception) or not r[0]:
                 continue
-            found = [m for m in msgs if hit(m)]
-            if found:
-                lines = await render(c, found[-limit:])
-                out += [f"[{t.get(cid, cid)} | {cid}] {x}" if not chat else x for x in lines]
+            out += [f"[{t.get(cid, cid)} | {cid}] {x}" for x in await render(c, list(reversed(r[0][:limit])), 600)]
         return "\n".join(out[-limit:]) or "Ничего не найдено."
 
     @tool()
@@ -359,19 +407,13 @@ def register(tool, Image):
         return "\n".join(f"{m.contact.id} | {uname(m.contact)}" for m in ms) or "Заявок нет."
 
     @tool()
-    async def max_export_chat(chat: str, limit: int = 500, text_limit: int = 500) -> str:
-        """Выгрузить историю чата или канала целиком для анализа и пересказа (до 3000 сообщений).
+    async def max_export_chat(chat: str, limit: int = 500, text_limit: int = 500, date_from: str = "", date_to: str = "") -> str:
+        """Выгрузить историю чата или канала для анализа и пересказа (до 5000 сообщений), при желании за период.
 
         text_limit — обрезать длинные сообщения до стольких символов."""
         c = await mx()
-        cid = await chat_id(c, chat)
-        msgs = await fetch(c, cid, max(1, min(limit, 3000)))
-        for m in msgs:
-            if m.text and len(m.text) > text_limit:
-                m.text = m.text[:text_limit] + "…"
-        lines = await render(c, msgs)
-        head = f"{len(lines)} сообщений" + (f", с {when(msgs[0].time)} по {when(msgs[-1].time)}" if msgs else "")
-        return head + "\n" + "\n".join(lines)
+        lines, hint = await core.history(c, await chat_id(c, chat), limit, date_from, date_to, 0, text_limit)
+        return "\n".join([f"{len(lines)} сообщений", *lines, *([hint] if hint else [])]) if lines else "Сообщений за этот период нет."
 
     @tool()
     async def max_get_comments(chat: str, post_id: int, limit: int = 30) -> str:

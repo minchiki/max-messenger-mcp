@@ -26,7 +26,7 @@ jobs:
           import server
           tools = asyncio.run(server.mcp.list_tools())
           print(len(tools), "tools")
-          assert len(tools) >= 56
+          assert len(tools) >= 58
           EOF
       - name: read-only mode
         working-directory: app
@@ -55,7 +55,7 @@ jobs:
           sys.argv = ["server.py"]
           import server, httpx
           tools = asyncio.run(server.mcp.list_tools())
-          assert "max_logout" in [t.name for t in tools] and len(tools) >= 57, len(tools)
+          assert "max_logout" in [t.name for t in tools] and len(tools) >= 59, len(tools)
           app = server.mcp.streamable_http_app(streamable_http_path="/mcp", stateless_http=True)
           async def check():
               async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost:8766") as h:

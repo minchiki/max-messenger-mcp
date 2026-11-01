@@ -19,10 +19,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from cfg import make_client, session_exists
+from dates import parse_when
 from safety import clean, name
 
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Moscow"))
 FEED_SIZE = int(os.environ.get("MAX_FEED_SIZE", "2000"))
+HISTORY_MAX = 5000      # сообщений за один вызов
+HISTORY_CHARS = 80000   # символов в ответе: больше ассистент всё равно не прочитает
 IDLE_MIN = int(os.environ.get("MAX_IDLE_MIN", "60"))
 SAVED = 0  # «Избранное» в MAX — диалог с id 0
 STARTED = time.time()
@@ -354,8 +357,8 @@ def when(ms):
     return datetime.fromtimestamp(ms / 1000, TZ).strftime("%d.%m.%y %H:%M")
 
 
-def fmt(m, who):
-    body = " ".join(x for x in (kind(m), clean(m.text)) if x)
+def fmt(m, who, text_limit=4000):
+    body = " ".join(x for x in (kind(m), clean(m.text, text_limit)) if x)
     link, pre = getattr(m, "link", None), ""
     if link is not None:
         if str(link.type).endswith("REPLY"):
@@ -388,7 +391,70 @@ async def fetch(c, cid, limit, from_time=None, forward=0):
     return sorted(out, key=lambda m: m.time)
 
 
-async def render(c, msgs):
+async def render(c, msgs, text_limit=4000):
     me = me_id(c)
     who = await names(c, [m.sender for m in msgs if m.sender != me])
-    return [fmt(m, "я" if m.sender == me else who.get(m.sender, str(m.sender))) for m in msgs]
+    return [fmt(m, "я" if m.sender == me else who.get(m.sender, str(m.sender)), text_limit) for m in msgs]
+
+
+async def pages(c, cid, lo=None, hi=None, before_id=0):
+    """Страницы истории от новых к старым (по 100, внутри страницы тоже от новых к старым).
+
+    lo / hi — границы по времени (datetime), before_id — идти от сообщения с этим id назад."""
+    lo_ms, hi_ms = (int(lo.timestamp() * 1000) if lo else None), (int(hi.timestamp() * 1000) if hi else None)
+    t = hi_ms
+    if before_id:
+        m = await c.get_message(cid, before_id)
+        if m:
+            t = m.time if t is None else min(t, m.time)
+    seen = {before_id}
+    while True:
+        page = await c.fetch_history(cid, backward=100, **({"from_time": t} if t else {}))
+        fresh = sorted((m for m in page if m.id not in seen), key=lambda m: m.time, reverse=True)
+        if not fresh:
+            return
+        seen.update(m.id for m in fresh)
+        t = fresh[-1].time
+        yield [m for m in fresh if (hi_ms is None or m.time <= hi_ms) and (lo_ms is None or m.time >= lo_ms)]
+        if (lo_ms and t < lo_ms) or len(page) < 2:
+            return
+
+
+async def history(c, cid, limit, date_from="", date_to="", before_id=0, text_limit=1000):
+    """Сообщения с отсечкой по датам и размеру: (строки от старых к новым, подсказка для продолжения)."""
+    lo, hi = parse_when(date_from, TZ), parse_when(date_to, TZ, end=True)
+    if lo and hi and lo > hi:
+        raise ValueError("date_from позже date_to")
+    limit = max(1, min(limit, HISTORY_MAX))
+    got, size, stopped = [], 0, False
+    async for page in pages(c, cid, lo, hi, before_id):
+        for m in page:
+            cost = min(len(m.text or ""), text_limit) + 40
+            if got and (len(got) >= limit or size + cost > HISTORY_CHARS):
+                stopped = True
+                break
+            got.append(m)
+            size += cost
+        if stopped:
+            break
+    lines = await render(c, list(reversed(got)), text_limit)
+    hint = ""
+    if stopped:
+        hint = f"… показано {len(got)}, есть более старые. Продолжить: before_id={got[-1].id}" + (f", date_from={date_from}" if date_from else "")
+    return lines, hint
+
+
+async def scan(c, cid, hit, lo, hi, depth, limit, before_id=0):
+    """Просмотр истории подряд (MAX не ищет на сервере): (найденные от новых к старым, просмотрено, остановились по limit)."""
+    found, scanned, stopped = [], 0, False
+    async for page in pages(c, cid, lo, hi, before_id):
+        for m in page:
+            scanned += 1
+            if hit(m):
+                found.append(m)
+                if len(found) >= limit:
+                    stopped = True
+                    break
+        if stopped or scanned >= depth:
+            break
+    return found, scanned, stopped
