@@ -88,7 +88,14 @@ def mark_sent(cid, msg_id, what):
 tools_read.register(tool, Image)
 tools_write.register(tool, guard, mark_sent)
 if MULTI:
-    oauth.setup(mcp, tool)  # страницы входа, главная и max_logout
+    oauth.setup(mcp, tool)  # страницы входа, главная, /health и max_logout
+else:
+    from starlette.responses import JSONResponse
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health(request):
+        a = core.accounts.get("local")
+        return JSONResponse({"ok": True, "max": bool(a and a.alive())})
 
 
 # ---------- готовые сценарии (в Claude — слэш-команды) ----------

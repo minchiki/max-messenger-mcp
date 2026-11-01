@@ -132,6 +132,14 @@ sudo bash deploy/setup-https.sh max.example.com
 
 `MAX_PUBLIC_URL` — адрес, который видят ChatGPT и Claude (если используете ретранслятор на Vercel — его адрес). **Сохраните `MAX_MASTER_KEY` отдельно**: без него сохранённые сессии не расшифровать.
 
+Эксплуатация:
+
+- **резервные копии**: `sudo bash deploy/backup.sh` (согласованная копия базы, хранится 14 штук; для ежедневного запуска — строка cron в начале скрипта). Ключ `MAX_MASTER_KEY` храните отдельно от копий;
+- **мониторинг**: `GET /health` → `{"ok": true, "online": N}`;
+- **лимиты**: `setup-https.sh` включает в nginx 30 запросов в минуту на вход и регистрацию и 600 — на остальное с одного IP;
+- **страница конфиденциальности** `/privacy`: что хранится, как удалить данные, контакт оператора (`MAX_OPERATOR_CONTACT`);
+- модель угроз и как сообщить об уязвимости — в [SECURITY.md](SECURITY.md).
+
 Прежде чем открывать сервис другим людям, помните: на сервере будут ключи к чужим перепискам. Нужны политика конфиденциальности, защищённый сервер и резервная копия ключа, а при работе в России — соблюдение 152-ФЗ.
 
 ### Docker
@@ -188,6 +196,7 @@ claude mcp add max -e MAX_DIR="$PWD" -e MAX_SEND_ALLOW=me -- python "$PWD/server
 | `MAX_MAX_USERS` | `100` | сколько пользователей принимать |
 | `MAX_IDLE_MIN` | `60` | через сколько минут простоя закрывать подключение пользователя |
 | `MAX_REDIRECT_HOSTS` | `chatgpt.com,chat.openai.com,claude.ai,claude.com` | куда можно вернуть код авторизации (https); localhost разрешён всегда |
+| `MAX_OPERATOR_CONTACT` | `https://t.me/huicoding` | контакт оператора на странице конфиденциальности |
 | `MAX_REDIRECT_SCHEMES` | `cursor,vscode,vscode-insiders,windsurf` | схемы приложений для возврата кода |
 
 Журнал: `journalctl -u max-mcp -f` — каждая отправка и удаление пишутся строкой `MAX SEND …` / `MAX DELETE …`.

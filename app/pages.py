@@ -1,4 +1,5 @@
-"""HTML страниц многопользовательского режима: главная и вход в MAX. Без внешних скриптов и шрифтов."""
+"""HTML страниц многопользовательского режима: главная, вход в MAX, конфиденциальность. Без внешних скриптов и шрифтов."""
+import os
 from html import escape
 
 CSS = """
@@ -41,7 +42,8 @@ footer{margin-top:28px;font-size:13px;color:var(--dim)}footer a{color:var(--mute
 HEAD = ('<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
         '<meta name="color-scheme" content="dark"><title>{title}</title><style>' + CSS.replace("{", "{{").replace("}", "}}") + '</style></head><body><main>'
         '<div class="logo"><div class="mark">M</div>MAX для ИИ-ассистентов</div>')
-FOOT = ('<footer>Открытый код: <a href="https://github.com/minchiki/max-messenger-mcp">max-messenger-mcp</a> · '
+CONTACT = os.environ.get("MAX_OPERATOR_CONTACT", "https://t.me/huicoding")
+FOOT = ('<footer><a href="/privacy">Конфиденциальность</a> · открытый код: <a href="https://github.com/minchiki/max-messenger-mcp">max-messenger-mcp</a> · '
         'новости: <a href="https://t.me/huicoding">HUICODING</a>. Сервис не связан с VK и MAX.</footer></main></body></html>')
 
 
@@ -78,7 +80,7 @@ def login(pid, client_name, redirect_host):
 <div class="card who"><div>
   <p style="margin:0"><b>{app}</b> просит доступ к вашему аккаунту MAX: читать чаты и отправлять сообщения от вашего имени.</p>
   <span class="badge">вернёт вас на {escape(redirect_host)}</span>
-  <p class="small" style="margin:10px 0 0">Если вы не добавляли этот сервер в ассистента сами — закройте страницу.</p>
+  <p class="small" style="margin:10px 0 0">Если вы не добавляли этот сервер в ассистента сами — закройте страницу. Входя, вы соглашаетесь с <a href="/privacy" target="_blank">условиями хранения данных</a>.</p>
 </div></div>
 
 <div class="card center" id="s-wait"><div class="spin"></div><p>Готовим вход…</p></div>
@@ -120,6 +122,25 @@ document.getElementById("pwf").onsubmit=async e=>{{e.preventDefault();show("wait
  document.getElementById("pw").value="";poll()}};
 start();
 </script>
+""" + FOOT
+
+
+def privacy():
+    c = escape(CONTACT)
+    return HEAD.format(title="Конфиденциальность") + f"""
+<h1>Конфиденциальность</h1>
+<div class="card"><h2>Что хранится на сервере</h2><ol>
+<li>id и имя вашего аккаунта MAX;</li>
+<li>сессия MAX (токен входа и id устройства) — в зашифрованном виде;</li>
+<li>токены доступа ассистента — только в виде хешей SHA-256;</li>
+<li>регистрация приложения-клиента (название, адрес возврата).</li></ol></div>
+<div class="card"><h2>Что не хранится</h2>
+<p>Тексты сообщений, файлы, списки чатов и контактов. Они проходят через память сервера только на время запроса ассистента и последние события держатся в памяти до перезапуска или часа без обращений. В журнал пишутся лишь служебные события (вход, выход, факт отправки — id чата и сообщения, без текста).</p></div>
+<div class="card"><h2>Кто видит ваши данные</h2>
+<p>Ассистент (ChatGPT, Claude и т. п.), которому вы дали доступ: он получает то, что запросит у сервера, и обрабатывает это по правилам своей компании. Оператор сервера технически имеет доступ к серверу — пользуйтесь сервисом, только если доверяете ему, или поставьте свой сервер по инструкции на GitHub.</p></div>
+<div class="card"><h2>Как удалить данные</h2>
+<p>Попросите ассистента «выйди из MAX и удали мои данные» — сеанс в MAX завершится, а сессия и токены будут удалены с сервера сразу. Либо завершите этот сеанс в MAX в списке устройств: доступ пропадёт, а данные можно удалить по запросу оператору.</p></div>
+<div class="card"><h2>Оператор</h2><p>Связь: <a href="{c}">{c}</a></p></div>
 """ + FOOT
 
 

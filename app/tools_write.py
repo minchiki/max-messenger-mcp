@@ -81,7 +81,7 @@ def register(tool, guard, mark_sent):
         data, fname, mime = await media.fetch(file)
         m = await c.send_message(cid, caption or None, reply_to=reply_to or None,
                                  attachments=[to_attach(data, fname, mime, kind)])
-        mark_sent(cid, m.id, f"file={fname}")
+        mark_sent(cid, m.id, "file")
         return f"Отправлено (id {m.id})."
 
     @tool(write=True)
@@ -402,7 +402,7 @@ def register(tool, guard, mark_sent):
         data, fname, mime = await media.fetch(file)
         s = await c.send_story(Video(raw=data, name=fname) if mime.startswith("video/") else Photo(raw=data, name=fname),
                                link=link or None)
-        mark_sent("story", s.id, f"file={fname}")
+        mark_sent("story", s.id, "file")
         return f"История опубликована (id {s.id})."
 
     @tool(write=True, destructive=True)

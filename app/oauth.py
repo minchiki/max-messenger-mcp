@@ -282,6 +282,10 @@ def setup(mcp, tool):
     async def home(request: Request):
         return HTMLResponse(pages.home(BASE, await store.count_users(), MAX_USERS), headers=PAGE_HEADERS)
 
+    @mcp.custom_route("/privacy", methods=["GET"])
+    async def privacy(request: Request):
+        return HTMLResponse(pages.privacy(), headers=PAGE_HEADERS)
+
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request: Request):
         return JSONResponse({"ok": True, "online": sum(a.alive() for a in core.accounts.values())})

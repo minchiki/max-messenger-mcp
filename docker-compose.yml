@@ -8,3 +8,11 @@ services:
     # наружу только на localhost: HTTPS даёт ваш nginx/Caddy/Cloudflare Tunnel
     ports:
       - "127.0.0.1:8766:8766"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: ["no-new-privileges:true"]
