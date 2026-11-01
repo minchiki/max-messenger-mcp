@@ -1,0 +1,21 @@
+[Unit]
+Description=max-messenger-mcp (MAX MCP server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=maxmcp
+Group=maxmcp
+WorkingDirectory=/opt/max-mcp
+EnvironmentFile=/etc/max-mcp/env
+ExecStart=/opt/max-mcp/venv/bin/python /opt/max-mcp/server.py
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/max-mcp
+
+[Install]
+WantedBy=multi-user.target
