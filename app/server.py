@@ -1,11 +1,12 @@
 """MCP-сервер для личного аккаунта MAX (HTTP для ChatGPT/Claude, stdio для локальных клиентов).
 
-Защита: секретный путь /<MAX_SECRET>/mcp, белый список отправки MAX_SEND_ALLOW
-("me" = Избранное, id чатов через запятую, "*" = любые), лимит MAX_SEND_PER_MIN,
-READ_ONLY=1 — только чтение.
+Один владелец (по умолчанию): секретный путь /<MAX_SECRET>/mcp, сессия из login.sh.
+Много пользователей (MAX_MULTIUSER=1): адрес /mcp, вход через OAuth и QR на странице сервиса,
+у каждого свой зашифрованный аккаунт.
+Защита: белый список отправки MAX_SEND_ALLOW ("me" = Избранное, id чатов через запятую, "*" = любые),
+лимит MAX_SEND_PER_MIN на аккаунт, READ_ONLY=1 — только чтение.
 """
 import asyncio
-import collections
 import functools
 import os
 import sys
@@ -22,18 +23,24 @@ import tools_write
 from safety import INSTRUCTIONS
 
 STDIO = "--stdio" in sys.argv
+MULTI = os.environ.get("MAX_MULTIUSER", "").lower() in ("1", "true", "yes")
 SECRET = os.environ.get("MAX_SECRET", "")
 HOST = os.environ.get("MAX_HOST", "127.0.0.1")  # в Docker — 0.0.0.0
 PORT = int(os.environ.get("MAX_PORT", "8766"))
 SEND_ALLOW = {"0" if x.strip().lower() in ("me", "saved") else x.strip()
-              for x in os.environ.get("MAX_SEND_ALLOW", "me").split(",") if x.strip()}
+              for x in os.environ.get("MAX_SEND_ALLOW", "*" if MULTI else "me").split(",") if x.strip()}
 SEND_PER_MIN = int(os.environ.get("MAX_SEND_PER_MIN", "20"))
 READ_ONLY = os.environ.get("READ_ONLY", "").lower() in ("1", "true", "yes")
 
-if not STDIO and len(SECRET) < 24:
-    raise SystemExit("MAX_SECRET должен быть не короче 24 символов")
-
-mcp = MCPServer("max-messenger-mcp", instructions=INSTRUCTIONS, version="1.0.0")
+if MULTI:
+    import oauth
+    mcp = MCPServer("max-messenger-mcp", instructions=INSTRUCTIONS, version="1.1.0",
+                    auth_server_provider=oauth.provider, auth=oauth.settings())
+    core.resolver = oauth.resolve
+else:
+    if not STDIO and len(SECRET) < 24:
+        raise SystemExit("MAX_SECRET должен быть не короче 24 символов")
+    mcp = MCPServer("max-messenger-mcp", instructions=INSTRUCTIONS, version="1.1.0")
 
 
 def tool(write=False, destructive=False, **kw):
@@ -58,30 +65,30 @@ def tool(write=False, destructive=False, **kw):
     return deco
 
 
-_sent = collections.deque()
-
-
 def guard(cid, text=None):
-    """Белый список, длина и лимит в минуту. None = можно. cid=None — проверить только лимит."""
+    """Белый список, длина и лимит в минуту на аккаунт. None = можно. cid=None — проверить только лимит."""
     if cid is not None and "*" not in SEND_ALLOW and str(cid) not in SEND_ALLOW:
         return f"Отказ: чат {cid} не в белом списке отправки (MAX_SEND_ALLOW)."
     if text is not None and (not text.strip() or len(text) > 4000):
         return "Отказ: пустой или слишком длинный текст."
-    now = time.time()
-    while _sent and now - _sent[0] > 60:
-        _sent.popleft()
-    if len(_sent) >= SEND_PER_MIN:
+    sent, now = core.CUR.get().sent, time.time()
+    while sent and now - sent[0] > 60:
+        sent.popleft()
+    if len(sent) >= SEND_PER_MIN:
         return f"Отказ: лимит {SEND_PER_MIN} отправок в минуту."
     return None
 
 
 def mark_sent(cid, msg_id, what):
-    _sent.append(time.time())
-    core.log(f"MAX SEND chat={cid} id={msg_id} {what}")
+    a = core.CUR.get()
+    a.sent.append(time.time())
+    core.log(f"MAX SEND [{a.key}] chat={cid} id={msg_id} {what}")
 
 
 tools_read.register(tool, Image)
 tools_write.register(tool, guard, mark_sent)
+if MULTI:
+    oauth.setup(mcp, tool)  # страницы входа, главная и max_logout
 
 
 # ---------- готовые сценарии (в Claude — слэш-команды) ----------
@@ -142,6 +149,6 @@ if __name__ == "__main__":
         mcp.run("stdio")
     else:
         import uvicorn
-        app = mcp.streamable_http_app(host=HOST, streamable_http_path=f"/{SECRET}/mcp", stateless_http=True,
+        app = mcp.streamable_http_app(host=HOST, streamable_http_path="/mcp" if MULTI else f"/{SECRET}/mcp", stateless_http=True,
                                       transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
         uvicorn.run(Asgi(app, bool(os.environ.get("MAX_DEBUG"))), host=HOST, port=PORT)

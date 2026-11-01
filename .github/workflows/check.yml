@@ -38,5 +38,30 @@ jobs:
           assert all(t.annotations.read_only_hint for t in tools), "write tool leaked into READ_ONLY"
           print(len(tools), "read-only tools")
           EOF
+      - name: multi-user mode (OAuth)
+        working-directory: app
+        env:
+          MAX_MULTIUSER: "1"
+          MAX_PUBLIC_URL: http://localhost:8766
+          MAX_DIR: /tmp/maxci
+        run: |
+          export MAX_MASTER_KEY=$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')
+          python - <<'EOF'
+          import asyncio, sys
+          sys.argv = ["server.py"]
+          import server, httpx
+          tools = asyncio.run(server.mcp.list_tools())
+          assert "max_logout" in [t.name for t in tools] and len(tools) >= 57, len(tools)
+          app = server.mcp.streamable_http_app(streamable_http_path="/mcp", stateless_http=True)
+          async def check():
+              async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost:8766") as h:
+                  assert (await h.post("/mcp", json={})).status_code == 401
+                  meta = (await h.get("/.well-known/oauth-authorization-server")).json()
+                  assert meta["registration_endpoint"].endswith("/register")
+                  assert (await h.get("/")).status_code == 200
+              await server.oauth.store.close()
+          asyncio.run(check())
+          print(len(tools), "tools, OAuth endpoints ok")
+          EOF
       - name: shell syntax
         run: for f in deploy/*.sh; do bash -n "$f"; done

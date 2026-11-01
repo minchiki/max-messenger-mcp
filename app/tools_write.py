@@ -217,8 +217,8 @@ def register(tool, guard, mark_sent):
         last = await c.fetch_history(cid, backward=1)
         if last:
             await c.read_message(last[-1].id, cid)
-        if cid in core.chats:
-            core.chats[cid].new_messages = 0
+        if cid in c.acc.chats:
+            c.acc.chats[cid].new_messages = 0
         return "Прочитано."
 
     # ---------- группы и каналы ----------
@@ -230,7 +230,7 @@ def register(tool, guard, mark_sent):
         r = await c.create_group(title, user_ids)
         if not r:
             return "MAX не вернул данные группы."
-        core.chats[r[0].id] = r[0]
+        c.acc.chats[r[0].id] = r[0]
         return f"Группа создана: id={r[0].id}"
 
     @tool(write=True)
@@ -309,7 +309,7 @@ def register(tool, guard, mark_sent):
         """Вступить в группу или канал по ссылке-приглашению."""
         c = await mx()
         ch = await (c.join_channel(link) if "/channel" in link else c.join_group(link))
-        core.chats[ch.id] = ch
+        c.acc.chats[ch.id] = ch
         return f"Вступил: {ch.id} | {name(ch.title)}"
 
     @tool(write=True, destructive=True)
@@ -319,7 +319,7 @@ def register(tool, guard, mark_sent):
         cid = await chat_id(c, chat)
         ch = await get_chat(c, cid)
         await (c.leave_channel(cid) if is_channel(ch) else c.leave_group(cid))
-        core.chats.pop(cid, None)
+        c.acc.chats.pop(cid, None)
         return "Вышел."
 
     @tool(write=True, destructive=True)
@@ -329,7 +329,7 @@ def register(tool, guard, mark_sent):
         cid = await chat_id(c, chat)
         ch = await get_chat(c, cid)
         await c.delete_chat(cid, last_event_time=ch.last_event_time, for_all=for_everyone)
-        core.chats.pop(cid, None)
+        c.acc.chats.pop(cid, None)
         log(f"MAX DELETE CHAT {cid}")
         return "Чат удалён."
 
@@ -396,10 +396,10 @@ def register(tool, guard, mark_sent):
     @tool(write=True, meta=media.FILE_META)
     async def max_post_story(file: str | dict, link: str = "") -> str:
         """Опубликовать историю из фото или видео (ссылка или файл из чата ChatGPT); link — ссылка на истории."""
+        c = await mx()
         if err := guard(None):
             return err
         data, fname, mime = await media.fetch(file)
-        c = await mx()
         s = await c.send_story(Video(raw=data, name=fname) if mime.startswith("video/") else Photo(raw=data, name=fname),
                                link=link or None)
         mark_sent("story", s.id, f"file={fname}")

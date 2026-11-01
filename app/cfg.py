@@ -26,11 +26,9 @@ class QuietWebClient(WebClient):
         return config
 
 
-def make_client(**kw) -> WebClient:
-    return QuietWebClient(
-        session_name=MAX_SESSION,
-        work_dir=MAX_DIR,
-        # переподключением занимается core.keeper: так обработчики событий не теряются
-        extra_config=ExtraConfig(reconnect=False, relogin=False, telemetry=False, log_level="WARNING"),
-        **kw,
-    )
+def make_client(store=None, password_attempts=None, **kw) -> WebClient:
+    """store — своё хранилище сессии (многопользовательский режим), иначе MAX_DIR/max.db."""
+    extra = ExtraConfig(reconnect=False, relogin=False, telemetry=False, log_level="WARNING",
+                        store=store, password_max_attempts=password_attempts)
+    # переподключением занимается core.Account: так обработчики событий не теряются
+    return QuietWebClient(session_name=MAX_SESSION, work_dir=MAX_DIR, extra_config=extra, **kw)

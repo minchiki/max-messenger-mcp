@@ -1,12 +1,16 @@
-"""Постоянное подключение к MAX, кэш чатов и имён, живая лента событий.
+"""Аккаунты MAX: постоянное подключение, кэш чатов и имён, живая лента событий.
 
-Подключение одно на весь процесс: вызов инструмента не ждёт рукопожатия (~0,1 с вместо ~1 с).
-Список чатов держится в памяти и обновляется событиями, поэтому max_list_chats и поиск чата
+Каждый аккаунт держит одно подключение: вызов инструмента не ждёт рукопожатия (~0,1 с вместо ~1 с).
+Список чатов хранится в памяти и обновляется событиями, поэтому max_list_chats и поиск чата
 по названию не ходят в сеть. События (новые, изменённые, удалённые сообщения, реакции)
 складываются в ленту: max_get_updates и max_wait_for_message читают её без опроса чатов.
+
+Режимы: один аккаунт владельца сервера или много пользователей (MAX_MULTIUSER=1) —
+тогда аккаунт выбирается по OAuth-токену запроса, а простаивающие подключения закрываются.
 """
 import asyncio
 import collections
+import contextvars
 import inspect
 import os
 import sys
@@ -19,81 +23,173 @@ from safety import clean, name
 
 TZ = ZoneInfo(os.environ.get("TZ_NAME", "Europe/Moscow"))
 FEED_SIZE = int(os.environ.get("MAX_FEED_SIZE", "2000"))
+IDLE_MIN = int(os.environ.get("MAX_IDLE_MIN", "60"))
 SAVED = 0  # «Избранное» в MAX — диалог с id 0
 STARTED = time.time()
 
-chats = {}               # id -> Chat, свежие данные приходят событиями
-feed = collections.deque(maxlen=FEED_SIZE)
-_client = None
-_lock = asyncio.Lock()
-_new = asyncio.Condition()
-_keeper = None
-_seq = 0
+CUR = contextvars.ContextVar("max_account")  # аккаунт текущего вызова инструмента
+accounts = {}            # ключ -> Account
+resolver = None          # многопользовательский режим: () -> (ключ, фабрика клиента)
 
 
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
-# ---------- подключение ----------
+class SessionRevoked(RuntimeError):
+    pass
+
+
+class Account:
+    def __init__(self, key, factory):
+        self.key, self.factory = key, factory
+        self.client = None
+        self.chats = {}                       # id -> Chat, свежие данные приходят событиями
+        self.feed = collections.deque(maxlen=FEED_SIZE)
+        self.seq = 0
+        self.sent = collections.deque()       # время отправок для лимита в минуту
+        self.used = time.time()
+        self.revoked = False
+        self._new = asyncio.Condition()
+        self._lock = asyncio.Lock()
+        self._keeper = None
+
+    def alive(self):
+        c = self.client
+        return c is not None and c.is_connected and c.me is not None
+
+    async def get(self):
+        """Клиент MAX: готовое подключение или новое, если связь оборвалась."""
+        self.used = time.time()
+        if self.revoked:
+            raise SessionRevoked("Сессия MAX завершена (выход на всех устройствах?): войдите заново")
+        if not self.alive():
+            async with self._lock:
+                if not self.alive():
+                    await self._connect()
+        if self._keeper is None or self._keeper.done():
+            self._keeper = asyncio.create_task(self._keep())
+        return self.client
+
+    async def _connect(self):
+        await self._drop()
+        c = self.factory()
+        c.acc = self
+        _attach(self, c)
+        try:
+            await c.connect()
+        except Exception as e:
+            if any(x in str(e) for x in ("FAIL_LOGIN_TOKEN", "FAIL_LOGOUT_ALL", "login.token")):
+                self.revoked = True
+                raise SessionRevoked("Сессия MAX недействительна: войдите заново") from e
+            raise
+        if c.me is None:
+            raise RuntimeError("Не удалось войти в MAX: войдите заново")
+        self.client = c
+        await load_chats(c)
+
+    async def _drop(self):
+        if self.client is not None:
+            try:
+                await self.client.close()
+            except Exception:
+                pass
+            self.client = None
+
+    async def _keep(self):
+        """Следит за связью: переподключает сразу, а не при следующем вызове инструмента."""
+        delay = 5
+        while not self.revoked:
+            await asyncio.sleep(15)
+            if self.alive():
+                delay = 5
+                continue
+            try:
+                async with self._lock:
+                    await self._connect()
+                log(f"MAX reconnected [{self.key}]")
+                delay = 5
+            except SessionRevoked:
+                log(f"MAX session revoked [{self.key}]")
+                return
+            except Exception as e:
+                log(f"MAX reconnect failed [{self.key}]: {e}")
+                await asyncio.sleep(min(delay, 300))
+                delay *= 2
+
+    async def close(self):
+        if self._keeper is not None:
+            self._keeper.cancel()
+        await self._drop()
+
+    # ---------- лента событий ----------
+
+    async def push(self, kind, chat_id, msg=None, **extra):
+        self.seq += 1
+        self.feed.append(dict(seq=self.seq, kind=kind, chat=chat_id, msg=msg, at=time.time(), **extra))
+        async with self._new:
+            self._new.notify_all()
+
+    async def wait(self, pred, since, timeout):
+        """События после since, подходящие под pred; ждёт до timeout секунд, если их ещё нет."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        async with self._new:
+            while True:
+                hit = [e for e in self.feed if e["seq"] > since and pred(e)]
+                left = deadline - loop.time()
+                if hit or left <= 0:
+                    return hit
+                try:
+                    await asyncio.wait_for(self._new.wait(), left)
+                except asyncio.TimeoutError:
+                    pass
+
+
+def _local():
+    if not session_exists():
+        raise RuntimeError("Сессия MAX не создана: выполните login.sh")
+    return make_client()
+
+
+async def current():
+    """Аккаунт текущего вызова: владельца сервера или пользователя OAuth-токена."""
+    if resolver is None:
+        key, factory = "local", _local
+    else:
+        key, factory = resolver()
+    a = accounts.get(key)
+    if a is None:
+        a = accounts[key] = Account(key, factory)
+    CUR.set(a)
+    return a
+
 
 async def mx():
-    """Клиент MAX: готовое подключение или новое, если связь оборвалась."""
-    global _keeper
-    c = _client
-    if c is None or not c.is_connected or c.me is None:
-        async with _lock:
-            if _client is None or not _client.is_connected or _client.me is None:
-                await _connect()
-        c = _client
-    if _keeper is None or _keeper.done():
-        _keeper = asyncio.create_task(_keep())
-    return c
+    return await (await current()).get()
+
+
+async def forget(key):
+    a = accounts.pop(key, None)
+    if a is not None:
+        await a.close()
 
 
 async def warm():
-    try:
-        await mx()
-        log(f"MAX connected: {len(chats)} chats")
-    except Exception as e:
-        log(f"MAX warmup failed: {e}")
-
-
-async def _connect():
-    global _client
-    if not session_exists():
-        raise RuntimeError("Сессия MAX не создана: выполните login.sh")
-    if _client is not None:
+    """Однопользовательский режим: подключиться при старте. Многопользовательский: закрывать простаивающих."""
+    if resolver is None:
         try:
-            await _client.close()
-        except Exception:
-            pass
-    c = make_client()
-    _attach(c)
-    await c.connect()
-    if c.me is None:
-        raise RuntimeError("Не удалось войти в MAX: выполните login.sh заново")
-    _client = c
-    await load_chats(c)
-
-
-async def _keep():
-    """Следит за связью: переподключает сразу, а не при следующем вызове инструмента."""
-    delay = 5
-    while True:
-        await asyncio.sleep(15)
-        if _client is not None and _client.is_connected:
-            delay = 5
-            continue
-        try:
-            async with _lock:
-                await _connect()
-            log("MAX reconnected")
-            delay = 5
+            await mx()
+            log(f"MAX connected: {len(accounts['local'].chats)} chats")
         except Exception as e:
-            log(f"MAX reconnect failed: {e}")
-            await asyncio.sleep(min(delay, 300))
-            delay *= 2
+            log(f"MAX warmup failed: {e}")
+        return
+    while True:
+        await asyncio.sleep(300)
+        for key, a in list(accounts.items()):
+            if time.time() - a.used > IDLE_MIN * 60:
+                await forget(key)
+                log(f"MAX idle closed [{key}]")
 
 
 def me_id(c):
@@ -110,44 +206,14 @@ async def load_chats(c):
             break
         got.update((ch.id, ch) for ch in fresh)
         marker = min(ch.last_event_time for ch in page)
-    chats.clear()
-    chats.update(got)
+    c.acc.chats.clear()
+    c.acc.chats.update(got)
 
 
-# ---------- лента событий ----------
-
-async def push(kind, chat_id, msg=None, **extra):
-    global _seq
-    _seq += 1
-    feed.append(dict(seq=_seq, kind=kind, chat=chat_id, msg=msg, at=time.time(), **extra))
-    async with _new:
-        _new.notify_all()
-
-
-def last_seq():
-    return _seq
-
-
-async def wait_feed(pred, since, timeout):
-    """События после since, подходящие под pred; ждёт до timeout секунд, если их ещё нет."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    async with _new:
-        while True:
-            hit = [e for e in feed if e["seq"] > since and pred(e)]
-            left = deadline - loop.time()
-            if hit or left <= 0:
-                return hit
-            try:
-                await asyncio.wait_for(_new.wait(), left)
-            except asyncio.TimeoutError:
-                pass
-
-
-def _attach(c):
+def _attach(a, c):
     @c.on_message()
     async def _msg(m, *_):
-        ch = chats.get(m.chat_id)
+        ch = a.chats.get(m.chat_id)
         if ch is None:
             asyncio.create_task(_add_chat(c, m.chat_id))
         else:
@@ -157,35 +223,35 @@ def _attach(c):
                     ch.new_messages += 1
             except Exception:
                 pass
-        await push("new", m.chat_id, m)
+        await a.push("new", m.chat_id, m)
 
     @c.on_message_edit()
     async def _edit(m, *_):
-        await push("edit", m.chat_id, m)
+        await a.push("edit", m.chat_id, m)
 
     @c.on_message_delete()
     async def _delete(e, *_):
-        await push("delete", e.chat_id, ids=list(e.message_ids))
+        await a.push("delete", e.chat_id, ids=list(e.message_ids))
 
     @c.on_reaction_update()
     async def _reaction(e, *_):
         counters = " ".join(f"{x.reaction}{x.count}" for x in (e.counters or []))
-        await push("reaction", e.chat_id, ids=[e.message_id], text=counters)
+        await a.push("reaction", e.chat_id, ids=[e.message_id], text=counters)
 
     @c.on_message_read()
     async def _read(e, *_):
-        ch = chats.get(e.chat_id)
+        ch = a.chats.get(e.chat_id)
         if ch is not None and e.user_id == me_id(c) and not e.set_as_unread:
             ch.new_messages = 0
 
     @c.on_chat_update()
     async def _chat(ch, *_):
-        chats[ch.id] = ch
+        a.chats[ch.id] = ch
 
 
 async def _add_chat(c, chat_id):
     try:
-        chats[chat_id] = await c.get_chat(chat_id)
+        c.acc.chats[chat_id] = await c.get_chat(chat_id)
     except Exception:
         pass
 
@@ -234,9 +300,9 @@ async def chat_id(c, chat):
         return int(s)
     except ValueError:
         pass
-    if not chats:
+    if not c.acc.chats:
         await load_chats(c)
-    t = await titles(c, list(chats.values()))
+    t = await titles(c, list(c.acc.chats.values()))
     q = s.lstrip("@").casefold()
     hit = [i for i, n in t.items() if n.casefold() == q] or [i for i, n in t.items() if q in n.casefold()]
     if len(hit) == 1:
@@ -247,9 +313,9 @@ async def chat_id(c, chat):
 
 
 async def get_chat(c, cid):
-    ch = chats.get(cid)
+    ch = c.acc.chats.get(cid)
     if ch is None:
-        ch = chats[cid] = await c.get_chat(cid)
+        ch = c.acc.chats[cid] = await c.get_chat(cid)
     return ch
 
 

@@ -42,7 +42,7 @@ def register(tool, Image):
         ping = (time.perf_counter() - t) * 1000
         up = int(time.time() - core.STARTED)
         return (f"аккаунт: {uname(c.me.contact)} (id {core.me_id(c)})\nсвязь: есть, ответ MAX {ping:.0f} мс\n"
-                f"чатов в кэше: {len(core.chats)}\nсобытий в ленте: {len(core.feed)}, последний номер {core.last_seq()}\n"
+                f"чатов в кэше: {len(c.acc.chats)}\nсобытий в ленте: {len(c.acc.feed)}, последний номер {c.acc.seq}\n"
                 f"работает: {up // 3600} ч {up % 3600 // 60} мин")
 
     @tool()
@@ -53,9 +53,9 @@ def register(tool, Image):
         query — часть названия; type — личный, группа или канал; refresh — перечитать список с сервера
         (обычно не нужно: список обновляется событиями)."""
         c = await mx()
-        if refresh or not core.chats:
+        if refresh or not c.acc.chats:
             await core.load_chats(c)
-        chs = sorted(core.chats.values(), key=lambda x: x.last_event_time, reverse=True)
+        chs = sorted(c.acc.chats.values(), key=lambda x: x.last_event_time, reverse=True)
         t = await core.titles(c, chs)
         q = query.casefold()
         out = []
@@ -76,7 +76,7 @@ def register(tool, Image):
         c = await mx()
         cid = await chat_id(c, chat)
         ch = await c.get_chat(cid)
-        core.chats[cid] = ch
+        c.acc.chats[cid] = ch
         t = (await core.titles(c, [ch]))[cid]
         who = await names(c, [ch.owner, *ch.admins])
         lines = [f"id={ch.id}", f"название={t}", f"тип={core.ctype(ch)}", f"участников={ch.participants_count or len(ch.participants)}"]
@@ -134,7 +134,7 @@ def register(tool, Image):
         if chat:
             ids = [await chat_id(c, chat)]
         else:
-            ids = [ch.id for ch in sorted(core.chats.values(), key=lambda x: x.last_event_time, reverse=True)[:30]]
+            ids = [ch.id for ch in sorted(c.acc.chats.values(), key=lambda x: x.last_event_time, reverse=True)[:30]]
             depth = min(depth, 150)
 
         def hit(m):
@@ -142,7 +142,7 @@ def register(tool, Image):
             return q in f"{m.text or ''} {files}".casefold()
 
         pages = await asyncio.gather(*(fetch(c, i, depth) for i in ids), return_exceptions=True)
-        t = await core.titles(c, [core.chats[i] for i in ids if i in core.chats])
+        t = await core.titles(c, [c.acc.chats[i] for i in ids if i in c.acc.chats])
         out = []
         for cid, msgs in zip(ids, pages):
             if isinstance(msgs, Exception):
@@ -158,7 +158,7 @@ def register(tool, Image):
         """Сводка непрочитанного: чаты с новыми сообщениями и сами сообщения (загружаются параллельно)."""
         c = await mx()
         await core.load_chats(c)
-        chs = sorted((ch for ch in core.chats.values() if ch.new_messages), key=lambda x: x.last_event_time, reverse=True)[:chats]
+        chs = sorted((ch for ch in c.acc.chats.values() if ch.new_messages), key=lambda x: x.last_event_time, reverse=True)[:chats]
         if not chs:
             return "Непрочитанных нет."
         t = await core.titles(c, chs)
@@ -178,9 +178,9 @@ def register(tool, Image):
         c = await mx()
         cid = await chat_id(c, chat) if chat else None
         me = core.me_id(c)
-        ev = [e for e in core.feed if e["seq"] > since and (cid is None or e["chat"] == cid)
+        ev = [e for e in c.acc.feed if e["seq"] > since and (cid is None or e["chat"] == cid)
               and (include_mine or not e["msg"] or e["msg"].sender != me)][-limit:]
-        return await _render_events(c, ev) + f"\n(следующий since={core.last_seq()})"
+        return await _render_events(c, ev) + f"\n(следующий since={c.acc.seq})"
 
     @tool()
     async def max_wait_for_message(chat: str = "", timeout: int = 50, since: int = -1) -> str:
@@ -190,12 +190,12 @@ def register(tool, Image):
         c = await mx()
         cid = await chat_id(c, chat) if chat else None
         me = core.me_id(c)
-        start = core.last_seq() if since < 0 else since
-        ev = await core.wait_feed(lambda e: e["kind"] == "new" and e["msg"].sender != me and (cid is None or e["chat"] == cid),
+        start = c.acc.seq if since < 0 else since
+        ev = await c.acc.wait(lambda e: e["kind"] == "new" and e["msg"].sender != me and (cid is None or e["chat"] == cid),
                                   start, max(1, min(timeout, 120)))
         if not ev:
             return f"За {timeout} с новых сообщений нет. (since={start})"
-        return await _render_events(c, ev) + f"\n(следующий since={core.last_seq()})"
+        return await _render_events(c, ev) + f"\n(следующий since={c.acc.seq})"
 
     async def _render_events(c, ev):
         if not ev:
@@ -203,7 +203,7 @@ def register(tool, Image):
         msgs = [e["msg"] for e in ev if e["msg"]]
         me = core.me_id(c)
         who = await names(c, [m.sender for m in msgs if m.sender != me])
-        t = await core.titles(c, [core.chats[i] for i in {e["chat"] for e in ev} if i in core.chats])
+        t = await core.titles(c, [c.acc.chats[i] for i in {e["chat"] for e in ev} if i in c.acc.chats])
         label = {"new": "новое", "edit": "изменено", "delete": "удалено", "reaction": "реакции"}
         out = []
         for e in ev:
@@ -288,7 +288,7 @@ def register(tool, Image):
         c = await mx()
         cid = await chat_id(c, chat)
         members, nxt = await c.get_chat_members(cid, marker=marker or None, count=min(limit, 200))
-        ch = core.chats.get(cid)
+        ch = c.acc.chats.get(cid)
         admins = set(ch.admins) if ch else set()
         out = [" | ".join(x for x in (str(m.contact.id), uname(m.contact), "админ" if m.contact.id in admins else "",
                                       _seen(m.presence)) if x) for m in members]

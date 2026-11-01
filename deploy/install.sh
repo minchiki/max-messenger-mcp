@@ -26,6 +26,9 @@ if [ ! -f "$ENVF" ]; then
   cp "$ROOT/deploy/env.example" "$ENVF"
   echo "MAX_SECRET=$(openssl rand -hex 24)" >> "$ENVF"
 fi
+# ключ шифрования сессий для многопользовательского режима; без него сохранённые сессии не расшифровать
+grep -q '^MAX_MASTER_KEY=' "$ENVF" || \
+  echo "MAX_MASTER_KEY=$("$APP/venv/bin/python" -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')" >> "$ENVF"
 chown root:maxmcp "$ENVF" && chmod 640 "$ENVF"
 
 cp "$ROOT/deploy/max-mcp.service" /etc/systemd/system/max-mcp.service
@@ -34,9 +37,14 @@ systemctl is-active --quiet max-mcp && systemctl restart max-mcp
 
 cat <<'EOF'
 
-Дальше по порядку:
+Свой аккаунт (по умолчанию):
   1) sudo bash deploy/login.sh                 — вход в MAX по QR
   2) sudo systemctl enable --now max-mcp
   3) sudo bash deploy/setup-https.sh [домен]   — HTTPS-адрес для ChatGPT / Claude
-Настройки (куда можно отправлять и т. п.): sudo nano /etc/max-mcp/env
+
+Сервис для многих пользователей (вход по ссылке):
+  в /etc/max-mcp/env впишите MAX_MULTIUSER=1 и MAX_PUBLIC_URL=https://ваш-домен, затем
+  sudo systemctl enable --now max-mcp && sudo bash deploy/setup-https.sh ваш-домен
+
+Настройки: sudo nano /etc/max-mcp/env  (ключ MAX_MASTER_KEY не меняйте и сохраните отдельно)
 EOF
