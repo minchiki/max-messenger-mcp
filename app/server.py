@@ -126,6 +126,8 @@ class Asgi:
                 m = await receive()
                 if m["type"] == "lifespan.startup":
                     asyncio.create_task(core.warm())
+                    if MULTI:
+                        asyncio.create_task(oauth.janitor())
                 return m
             return await self.app(scope, recv, send)
         if scope["type"] != "http" or not self.debug:
@@ -151,4 +153,5 @@ if __name__ == "__main__":
         import uvicorn
         app = mcp.streamable_http_app(host=HOST, streamable_http_path="/mcp" if MULTI else f"/{SECRET}/mcp", stateless_http=True,
                                       transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
-        uvicorn.run(Asgi(app, bool(os.environ.get("MAX_DEBUG"))), host=HOST, port=PORT)
+        # access_log выключен: в пути лежит секрет (/<MAX_SECRET>/mcp) или id входа (/login/<id>)
+        uvicorn.run(Asgi(app, bool(os.environ.get("MAX_DEBUG"))), host=HOST, port=PORT, access_log=False)

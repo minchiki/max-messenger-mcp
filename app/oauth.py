@@ -15,7 +15,7 @@ import qrcode
 import qrcode.image.svg
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.provider import (AccessToken, AuthorizationCode, AuthorizeError, RefreshToken,
-                                      construct_redirect_uri)
+                                      RegistrationError, construct_redirect_uri)
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pymax.auth.qr import QrAuthFlow
@@ -27,12 +27,32 @@ import core
 import pages
 import store
 from cfg import make_client
+from safety import clean
 
 BASE = os.environ.get("MAX_PUBLIC_URL", "").rstrip("/")
 MAX_USERS = int(os.environ.get("MAX_MAX_USERS", "100"))
-ACCESS_TTL = 30 * 86400
-REFRESH_TTL = 365 * 86400
+ACCESS_TTL = 86400
+REFRESH_TTL = 90 * 86400
 SCOPES = ["max"]
+LOGINS_RUNNING = 20  # одновременных входов (каждый держит подключение к MAX)
+# Куда можно вернуть код авторизации. Иначе любой зарегистрирует свой сайт (или javascript:),
+# пришлёт жертве ссылку входа и получит доступ к её MAX.
+REDIRECT_HOSTS = {h.strip().lower() for h in os.environ.get(
+    "MAX_REDIRECT_HOSTS", "chatgpt.com,chat.openai.com,claude.ai,claude.com").split(",") if h.strip()}
+APP_SCHEMES = {s.strip().lower() for s in os.environ.get(
+    "MAX_REDIRECT_SCHEMES", "cursor,vscode,vscode-insiders,windsurf").split(",") if s.strip()}
+LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+
+
+def redirect_ok(uri):
+    """https на разрешённые хосты, http(s) на localhost (Claude Code, MCP Inspector), схемы приложений."""
+    u = urlparse(str(uri))
+    scheme, host = u.scheme.lower(), (u.hostname or "").lower()
+    if scheme in ("http", "https") and host in LOOPBACK:
+        return True
+    if scheme == "https":
+        return host in REDIRECT_HOSTS
+    return scheme in APP_SCHEMES
 
 pending = {}   # id входа -> Login
 codes = {}     # код авторизации -> AuthorizationCode (живёт 5 минут)
@@ -73,14 +93,15 @@ class Provider:
         return OAuthClientInformationFull.model_validate_json(info) if info else None
 
     async def register_client(self, client_info):
+        bad = [str(u) for u in client_info.redirect_uris or [] if not redirect_ok(u)]
+        if bad:
+            raise RegistrationError("invalid_redirect_uri", f"Адрес возврата не разрешён: {bad[0][:100]}")
         await store.save_client(client_info.client_id, client_info.model_dump_json())
 
     async def authorize(self, client, params):
-        now = time.time()
-        for k, p in list(pending.items()):
-            if now - p.created > 900:
-                await p.stop()
-                pending.pop(k, None)
+        if not redirect_ok(params.redirect_uri):
+            raise AuthorizeError("invalid_request", "Адрес возврата не разрешён")
+        await sweep()
         if len(pending) >= 300:
             raise AuthorizeError("temporarily_unavailable", "Слишком много входов одновременно, попробуйте через минуту")
         p = Login(client, params)
@@ -133,6 +154,28 @@ class Provider:
 provider = Provider()
 
 
+async def sweep():
+    """Убрать брошенные входы, просроченные коды и токены."""
+    now = time.time()
+    for k, p in list(pending.items()):
+        if now - p.created > 900:
+            await p.stop()
+            pending.pop(k, None)
+    for k, c in list(codes.items()):
+        if c.expires_at < now:
+            codes.pop(k, None)
+    await store.cleanup()
+
+
+async def janitor():
+    while True:
+        await asyncio.sleep(300)
+        try:
+            await sweep()
+        except Exception as e:
+            core.log(f"sweep failed: {e}")
+
+
 # ---------- вход в MAX ----------
 
 class Login:
@@ -147,6 +190,10 @@ class Login:
 
     def start(self):
         if self.task is None or self.task.done():
+            running = sum(1 for p in pending.values() if p.task is not None and not p.task.done())
+            if running >= LOGINS_RUNNING:
+                self.status, self.error = "error", "Сейчас много входов одновременно, попробуйте через минуту"
+                return
             self.status, self.error = "starting", None
             self.task = asyncio.create_task(self._run())
 
@@ -160,6 +207,8 @@ class Login:
                 pass
 
     async def show_qr(self, qr_url):            # QrHandler для PyMax
+        if not str(qr_url).startswith("https://max.ru/"):  # ссылка уходит в href на странице
+            raise RuntimeError("MAX прислал неожиданную ссылку входа")
         self.qr, self.status = qr_url, "qr"
 
     async def get_password(self, hint=None):    # PasswordProvider для PyMax
@@ -197,15 +246,15 @@ class Login:
             codes[code.code] = code
             self.redirect = construct_redirect_uri(str(p.redirect_uri), code=code.code, state=p.state)
             self.status = "done"
-            core.log(f"MAX login ok user={uid} client={self.client.client_name or self.client.client_id}")
+            core.log(f"MAX login ok user={uid} client={self.client.client_id}")
         except PasswordAttemptsExceededError:
             self.status, self.error = "error", "Три неверных пароля подряд. Начните вход заново."
         except Exception as e:
             if "expired" in str(e):
                 self.status = "expired"
             else:
-                self.status, self.error = "error", f"{e}"
-                core.log(f"MAX login failed: {type(e).__name__}: {e}")
+                self.status, self.error = "error", clean(str(e), 200) or "Не удалось войти, попробуйте снова"
+                core.log(f"MAX login failed: {type(e).__name__}: {clean(str(e), 300)}")
         finally:
             try:
                 await c.close()
@@ -219,10 +268,19 @@ def _svg(link):
     return img.to_string(encoding="unicode")
 
 
+# Страницы без внешних ресурсов: CSP не даст подгрузить чужой скрипт, даже если что-то просочится в HTML
+PAGE_HEADERS = {
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                               "connect-src 'self'; img-src data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store",
+}
+
+
 def setup(mcp, tool):
     @mcp.custom_route("/", methods=["GET"])
     async def home(request: Request):
-        return HTMLResponse(pages.home(BASE, await store.count_users(), MAX_USERS))
+        return HTMLResponse(pages.home(BASE, await store.count_users(), MAX_USERS), headers=PAGE_HEADERS)
 
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request: Request):
@@ -232,10 +290,9 @@ def setup(mcp, tool):
     async def login_page(request: Request):
         p = pending.get(request.path_params["pid"])
         if p is None:
-            return HTMLResponse(pages.gone(), status_code=404)
-        host = urlparse(str(p.params.redirect_uri)).hostname or "?"
-        return HTMLResponse(pages.login(p.id, p.client.client_name, host),
-                            headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"})
+            return HTMLResponse(pages.gone(), status_code=404, headers=PAGE_HEADERS)
+        u = urlparse(str(p.params.redirect_uri))
+        return HTMLResponse(pages.login(p.id, p.client.client_name, u.hostname or f"приложение {u.scheme}"), headers=PAGE_HEADERS)
 
     @mcp.custom_route("/login/{pid}/start", methods=["POST"])
     async def login_start(request: Request):
@@ -263,7 +320,11 @@ def setup(mcp, tool):
         p = pending.get(request.path_params["pid"])
         if p is None:
             return JSONResponse({"status": "error"}, status_code=404)
-        p.password(str((await request.json()).get("password", ""))[:256])
+        try:
+            body = await request.json()
+        except ValueError:
+            return JSONResponse({"status": "error"}, status_code=400)
+        p.password(str(body.get("password", "") if isinstance(body, dict) else "")[:256])
         return JSONResponse({"status": "ok"})
 
     @tool(write=True, destructive=True)

@@ -53,7 +53,7 @@ def home(base, users, limit):
 <p>Вставьте ссылку в ассистента, войдите по QR — и он сможет читать чаты, искать, отвечать, делать сводки непрочитанного и ждать ответа собеседника.</p>
 <div class="card">
   <h2>Адрес сервера</h2>
-  <div class="url"><code id="u">{escape(mcp)}</code><button onclick="navigator.clipboard.writeText('{escape(mcp)}');this.textContent='Скопировано'">Копировать</button></div>
+  <div class="url"><code id="u">{escape(mcp)}</code><button onclick="navigator.clipboard.writeText(document.getElementById('u').textContent);this.textContent='Скопировано'">Копировать</button></div>
   {'<p class="err" style="margin-top:12px">Сейчас мест нет: сервис заполнен. Можно поставить свой сервер по инструкции на GitHub.</p>' if full else ''}
 </div>
 <div class="grid">
