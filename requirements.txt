@@ -2,5 +2,5 @@ mcp>=2.3,<3
 maxapi-python[video]>=2.5,<2.6
 httpx>=0.28.1
 uvicorn>=0.30
-qrcode>=7.4
+qrcode>=8.2
 cryptography>=42
