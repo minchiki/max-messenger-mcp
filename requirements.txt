@@ -3,4 +3,4 @@ maxapi-python[video]>=2.5,<2.6
 httpx>=0.28.1
 uvicorn>=0.30
 qrcode>=7.4
-cryptography>=42
+cryptography>=50.0.2
